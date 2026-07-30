@@ -1,9 +1,10 @@
 """
 BitDanceAR: GPT-style autoregressive transformer with binary diffusion head.
 
+Replaces categorical next-token prediction (softmax over RVQ codes) with
+flow-matching diffusion over continuous binary latent vectors {-1, +1}^C.
+
 Key features:
-- Dual-forward training: style extraction (full attention) + image generation (causal)
-- 32 learnable style tokens for residual style prediction
 - XSA (Exclusive Self-Attention) + HARoPE (Head-Aware Rotary Position Encoding)
   + ReLU² MLP blocks
 - DiffHead for per-position flow-matching generation with 2D coordinate awareness
@@ -15,36 +16,18 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 
 from diff_head import DiffHead
-from sampling import euler_maruyama
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_MAX_SPATIAL = 1024  # max Hq*Wq (supports up to 32×32 latent grids)
 MAX_DIFF_H = 64             # max Hq for diffusion position embedding
 MAX_DIFF_W = 64             # max Wq for diffusion position embedding
-NUM_STYLE_TOKENS = 32       # number of learnable style tokens
 
 
 # ── Custom Architecture Components ──────────────────────────────────────────
-
-class BinarySTE(torch.autograd.Function):
-    """Straight-Through Estimator for binary quantization. 
-    Allows gradients to flow through the sign() function."""
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return torch.sign(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        grad_input = grad_output.clone()
-        grad_input[x.abs() > 1] = 0
-        return grad_input
-
 
 class RMSNormNoParams(nn.Module):
     def __init__(self, eps: float = 1e-6):
@@ -80,6 +63,7 @@ class DiffusionPosEmbed(nn.Module):
 
     Factorized row + column embeddings compose to give O(H+W) parameters
     instead of O(H*W), while preserving explicit 2D topology.
+    The MLP learns that row 0 is "top" and row Hq-1 is "bottom", etc.
     """
     def __init__(self, d_model: int, max_h: int = MAX_DIFF_H,
                  max_w: int = MAX_DIFF_W):
@@ -116,8 +100,16 @@ class ExclusiveSelfAttention(nn.Module):
       along each position's own value vector.
     - HARoPE (Head-Aware Rotary Position Encoding): per-head SVD change-of-basis
       + 2D axial RoPE for relative position awareness in attention.
-    - Supports both causal and full (bidirectional) attention via full_attention flag.
-    - KV cache for fast autoregressive inference.
+
+    Each head gets its own SVD change-of-basis (A_h = U_h @ diag(s_h) @ V_h^T),
+    aligning rotary planes with semantic directions while preserving RoPE's
+    relative-offset property. Q is transformed by A, K by A^{-T}; the linear
+    parts cancel in the dot product, but RoPE rotations operate in the mixed
+    basis, effectively changing which dimension-pairs get rotated together.
+
+    Supports KV caching for fast autoregressive inference. The cache stores
+    K **after** A^{-T} and 2D-RoPE have been applied, so at generation time
+    the new Q (after A + RoPE) attends to cached K directly.
     """
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
@@ -143,14 +135,18 @@ class ExclusiveSelfAttention(nn.Module):
         nn.init.zeros_(self.Wo)
 
         # ── HARoPE: per-head SVD parameters ──
+        # A_h = U_h @ diag(s_h) @ V_h^T, where U_h, V_h are orthogonal
+        # (constructed via matrix exponential of skew-symmetric matrices)
+        # and s_h = softplus(sigma_h) > 0.
         num_skew = self.head_dim * (self.head_dim - 1) // 2
         self.U_skew = nn.Parameter(torch.zeros(n_head, num_skew))
         self.V_skew = nn.Parameter(torch.zeros(n_head, num_skew))
+        # softplus(0.541) ≈ 1.0  →  initialize near identity
         self.sigma = nn.Parameter(torch.ones(n_head, self.head_dim) * 0.541)
 
-        # 2D axial RoPE frequencies
+        # 2D axial RoPE frequencies (half dims for x-axis, half for y-axis)
         theta = 10000.0 ** (-2 * torch.arange(0, self.half_dim, 2).float() / self.half_dim)
-        self.register_buffer('theta', theta, persistent=False)
+        self.register_buffer('theta', theta, persistent=False)  # [half_dim/2]
 
         # KV cache state
         self._cache_k: Optional[torch.Tensor] = None
@@ -160,26 +156,41 @@ class ExclusiveSelfAttention(nn.Module):
     # ── SVD helpers ──
 
     def _orth_from_skew(self, params: torch.Tensor) -> torch.Tensor:
-        """Construct orthogonal matrices from skew-symmetric parameters via matrix exp."""
+        """Construct orthogonal matrices from skew-symmetric parameters via matrix exp.
+
+        params: [H, num_skew] → [H, d, d] orthogonal matrices.
+        Starting from zero params gives identity (matrix_exp(0) = I).
+        """
         H = params.shape[0]
         d = self.head_dim
         idx = torch.triu_indices(d, d, offset=1, device=params.device)
         mats = torch.zeros(H, d, d, device=params.device, dtype=params.dtype)
         mats[:, idx[0], idx[1]] = params
-        mats = mats - mats.transpose(-1, -2)
-        return torch.linalg.matrix_exp(mats)
+        mats = mats - mats.transpose(-1, -2)  # skew-symmetric
+        return torch.linalg.matrix_exp(mats)  # [H, d, d]
 
     def _apply_A(self, x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-        """Apply head-specific SVD change-of-basis."""
-        U = self._orth_from_skew(self.U_skew)
-        V = self._orth_from_skew(self.V_skew)
-        s = F.softplus(self.sigma)
+        """Apply head-specific SVD change-of-basis.
 
+        x: [B, H, T, d]
+        Forward  (Q): x @ U @ diag(s)   @ V^T  = x @ A
+        Inverse  (K): x @ U @ diag(1/s) @ V^T  = x @ A^{-T}
+
+        In the attention dot product, the linear parts cancel:
+            (x_q @ A)^T (x_k @ A^{-T}) = x_q^T x_k
+        But RoPE is applied *after* the basis change, so the rotations
+        operate in the mixed basis — this is the key HARoPE effect.
+        """
+        U = self._orth_from_skew(self.U_skew)  # [H, d, d]
+        V = self._orth_from_skew(self.V_skew)  # [H, d, d]
+        s = F.softplus(self.sigma)              # [H, d], guaranteed > 0
+
+        # x @ U
         x = torch.einsum('bhtd,hde->bhte', x, U)
         if not inverse:
-            x = x * s[None, :, None, :]
+            x = x * s[None, :, None, :]          # diag(s)
         else:
-            x = x / s[None, :, None, :]
+            x = x / s[None, :, None, :]          # diag(1/s)
         x = torch.einsum('bhtd,hde->bhte', x, V.transpose(-1, -2))
         return x
 
@@ -187,22 +198,35 @@ class ExclusiveSelfAttention(nn.Module):
 
     def _apply_2d_rope(self, x: torch.Tensor,
                        pos_x: torch.Tensor, pos_y: torch.Tensor) -> torch.Tensor:
-        """Apply 2D axial RoPE. First half dims rotated by x, second half by y."""
-        px = pos_x.unsqueeze(1)
-        py = pos_y.unsqueeze(1)
+        """Apply 2D axial RoPE.
 
-        x_x = x[..., :self.half_dim]
-        x_y = x[..., self.half_dim:]
+        First half of dims are rotated by x-position, second half by y-position.
+        This factorizes 2D position into two independent 1D RoPE blocks.
+
+        x: [B, H, T, d]
+        pos_x, pos_y: [B, T] — 2D coordinates for each token
+        """
+        # Expand pos for broadcasting across heads: [B, T] → [B, 1, T]
+        px = pos_x.unsqueeze(1)  # [B, 1, T]
+        py = pos_y.unsqueeze(1)  # [B, 1, T]
+
+        x_x = x[..., :self.half_dim]    # x-axis dims
+        x_y = x[..., self.half_dim:]    # y-axis dims
 
         x_x = self._apply_1d_rope(x_x, px)
         x_y = self._apply_1d_rope(x_y, py)
         return torch.cat([x_x, x_y], dim=-1)
 
     def _apply_1d_rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        """Apply 1D RoPE to paired (even, odd) dimensions."""
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-        angles = pos.unsqueeze(-1) * self.theta
+        """Apply 1D RoPE to paired (even, odd) dimensions.
+
+        x:   [B, H, T, half_dim]
+        pos: [B, 1, T]  (broadcastable)
+        """
+        x1 = x[..., 0::2]  # [B, H, T, half_dim/2]
+        x2 = x[..., 1::2]  # [B, H, T, half_dim/2]
+        # pos: [B, 1, T] → [B, 1, T, 1] for broadcasting with theta [half_dim/2]
+        angles = pos.unsqueeze(-1) * self.theta  # [B, 1, T, half_dim/2]
         cos_a = torch.cos(angles)
         sin_a = torch.sin(angles)
         rx1 = x1 * cos_a - x2 * sin_a
@@ -231,8 +255,7 @@ class ExclusiveSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 pos_x: Optional[torch.Tensor] = None,
-                pos_y: Optional[torch.Tensor] = None,
-                full_attention: bool = False) -> torch.Tensor:
+                pos_y: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, D = x.shape
         H = self.n_head
         hd = self.head_dim
@@ -243,12 +266,12 @@ class ExclusiveSelfAttention(nn.Module):
 
         # ── HARoPE: per-head SVD change-of-basis + 2D rotary ──
         if pos_x is not None and pos_y is not None:
-            Q = self._apply_A(Q, inverse=False)
-            K = self._apply_A(K, inverse=True)
+            Q = self._apply_A(Q, inverse=False)   # A  for Q
+            K = self._apply_A(K, inverse=True)    # A^{-T} for K
             Q = self._apply_2d_rope(Q, pos_x, pos_y)
             K = self._apply_2d_rope(K, pos_x, pos_y)
 
-        # ── KV cache logic ──
+        # ── KV cache logic (stores K after A^{-T} + RoPE) ──
         if self._cache_k is not None:
             pos = self._cache_pos
             self._cache_k[:B, :, pos:pos + T] = K
@@ -258,20 +281,21 @@ class ExclusiveSelfAttention(nn.Module):
             self._cache_pos = pos + T
 
             if T == 1:
+                # Single-token generation: attend to all cached KVs
                 Y = F.scaled_dot_product_attention(Q, K_full, V_full)
             elif pos == 0:
+                # Initial prefill: Q and K same length, efficient causal
                 Y = F.scaled_dot_product_attention(Q, K_full, V_full, is_causal=True)
             else:
+                # Multi-token with existing cache: custom causal mask
                 q_idx = torch.arange(pos, pos + T, device=x.device)
                 k_idx = torch.arange(pos + T, device=x.device)
                 causal_mask = q_idx[:, None] >= k_idx[None, :]
                 Y = F.scaled_dot_product_attention(Q, K_full, V_full,
                                                    attn_mask=causal_mask)
         else:
-            # Training: causal or full attention
-            Y = F.scaled_dot_product_attention(
-                Q, K, V, is_causal=not full_attention
-            )
+            # Training: standard causal attention
+            Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
         # XSA: remove self-value component
         Vn = F.normalize(V, dim=-1)
@@ -284,7 +308,7 @@ class ExclusiveSelfAttention(nn.Module):
 # ── Transformer Block ───────────────────────────────────────────────────────
 
 class GPTBlock(nn.Module):
-    """Pre-norm GPT block with XSA + HARoPE and ReLU²."""
+    """Pre-norm causal GPT block with XSA + HARoPE and ReLU²."""
     def __init__(self, d_model: int, n_head: int, dropout: float):
         super().__init__()
         self.ln_1 = RMSNormNoParams()
@@ -301,10 +325,8 @@ class GPTBlock(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 pos_x: Optional[torch.Tensor] = None,
-                pos_y: Optional[torch.Tensor] = None,
-                full_attention: bool = False) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), pos_x=pos_x, pos_y=pos_y,
-                          full_attention=full_attention)
+                pos_y: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), pos_x=pos_x, pos_y=pos_y)
         m = self.mlp_c_fc(self.ln_2(x))
         m = self.mlp_act(m)
         m = self.mlp_c_proj(m)
@@ -319,23 +341,17 @@ class BitDanceAR(nn.Module):
     """
     GPT-style AR transformer with binary diffusion head for image generation.
 
-    Dual-forward training:
-      Forward 1 (style extraction):
-        [32 learnable style queries, image tokens] → FULL attention
-        → predict 32 bit-quantized residual style tokens
-        → style loss (detached from transformer, only updates style tokens)
-
-      Forward 2 (image generation):
-        [shape, tags, style_cond (detached, first k∈{1,4,8,16,32}), image tokens]
-        → CAUSAL attention → diffusion loss (updates transformer)
-
     Architecture:
-        [shape_h, shape_w, tag_1, ..., tag_N, style_1, ..., style_k,
-         img_0, ..., img_{L-1}] → Causal Transformer → DiffHead per position
+        [PAD_h, PAD_w, tag_1, ..., tag_N, SEP] → Causal Transformer → h[0..L-1]
+        For each spatial position i: h[i] → DiffHead → pred_latent → sign() → {-1,+1}^C
 
     Position encoding:
         - Transformer attention: HARoPE (2D axial RoPE with per-head SVD basis)
         - DiffHead MLP: factorized 2D coordinate embedding (row + col)
+
+    Configurable patch_size:
+        patch_size=1: predict 1 spatial position per AR step (1x)
+        patch_size=2: predict 2 spatial positions per AR step (2x)
     """
 
     def __init__(
@@ -363,7 +379,6 @@ class BitDanceAR(nn.Module):
         P_mean: float = -0.8,
         pad_tag_id: int = 0,
         grad_checkpointing: bool = False,
-        style_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -377,7 +392,6 @@ class BitDanceAR(nn.Module):
         self.perturb_rate = perturb_rate
         self.pad_tag_id = pad_tag_id
         self.grad_checkpointing = grad_checkpointing
-        self.style_loss_weight = style_loss_weight
 
         # Feature dim per AR position
         self.patch_dim = latent_dim * patch_size  # C * patch_size
@@ -385,7 +399,7 @@ class BitDanceAR(nn.Module):
         # Pad vocab to multiples of 64 for Tensor Core efficiency
         padded_tag_vocab = (tag_vocab_size + 63) // 64 * 64
 
-        # ── Embeddings ──
+        # ── Embeddings (no 1D pos_embed — HARoPE handles positions in attention) ──
         self.tag_embed = nn.Embedding(padded_tag_vocab, d_model)
         self.shape_h_embed = nn.Embedding(num_shape_buckets, d_model)
         self.shape_w_embed = nn.Embedding(num_shape_buckets, d_model)
@@ -393,18 +407,6 @@ class BitDanceAR(nn.Module):
         # ── Vision latent projector ──
         self.proj_in = MLPConnector(self.patch_dim, d_model, dropout)
         self.emb_norm = RMSNormNoParams()
-
-        # ── Style tokens: 32 learnable tokens in latent_dim space ──
-        # Serve as both queries (forward 1 input) and targets (style loss)
-        self.style_tokens = nn.Parameter(
-            torch.zeros(NUM_STYLE_TOKENS, latent_dim)
-        )
-        nn.init.normal_(self.style_tokens, std=0.02)
-
-        # Style token projections
-        self.style_query_proj = MLPConnector(latent_dim, d_model, dropout)
-        self.style_pred_proj = nn.Linear(d_model, latent_dim)
-        self.style_cond_proj = MLPConnector(latent_dim, d_model, dropout)
 
         # ── Transformer ──
         self.layers = nn.ModuleList([
@@ -436,8 +438,7 @@ class BitDanceAR(nn.Module):
         print(f"BitDanceAR: {self.num_params:,} params "
               f"(d={d_model}, L={n_layer}, H={n_head}, "
               f"latent={latent_dim}, patch={patch_size}x, "
-              f"diff_layers={diff_layers}, diff_batch_mul={diff_batch_mul}, "
-              f"style_tokens={NUM_STYLE_TOKENS})")
+              f"diff_layers={diff_layers}, diff_batch_mul={diff_batch_mul})")
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Embedding):
@@ -463,22 +464,27 @@ class BitDanceAR(nn.Module):
 
         Image tokens use the 2D grid coordinates of their patch center:
             (col_j, row_j) for patch j = start_patch .. start_patch+n_img_tokens-1
+
+        Returns:
+            pos_x, pos_y: [B, N_prefix + n_img_tokens] float tensors
         """
         T = N_prefix + n_img_tokens
         pos_x = torch.zeros(B, T, device=device, dtype=torch.float32)
         pos_y = torch.zeros(B, T, device=device, dtype=torch.float32)
 
+        # Prefix: 1D line at x=0, y = 0..N_prefix-1
         if N_prefix > 0:
             pos_y[:, :N_prefix] = torch.arange(
                 N_prefix, device=device, dtype=torch.float32
             )
 
+        # Image tokens: 2D grid positions
         if n_img_tokens > 0:
             p = self.patch_size
             patch_indices = torch.arange(
                 start_patch, start_patch + n_img_tokens, device=device
             )
-            spatial = patch_indices * p + p // 2
+            spatial = patch_indices * p + p // 2  # center of patch
             rows = (spatial // Wq).float()
             cols = (spatial % Wq).float()
             pos_x[:, N_prefix:] = cols
@@ -488,7 +494,10 @@ class BitDanceAR(nn.Module):
 
     def _diff_position_indices(self, L: int, Hq: int, Wq: int,
                                device: torch.device):
-        """Compute (rows, cols) LongTensors for L patches (0..L-1)."""
+        """Compute (rows, cols) LongTensors for L patches (0..L-1).
+
+        Used for the DiffusionPosEmbed which requires integer indices.
+        """
         p = self.patch_size
         patch_indices = torch.arange(L, device=device, dtype=torch.long)
         spatial = patch_indices * p + p // 2
@@ -499,7 +508,10 @@ class BitDanceAR(nn.Module):
     # ── Patchify / Unpatchify ────────────────────────────────────────────────
 
     def patchify(self, latents: torch.Tensor) -> torch.Tensor:
-        """[B, C, Hq, Wq] → [B, L, C*patch_size] where L = (Hq*Wq) // patch_size."""
+        """
+        [B, C, Hq, Wq] → [B, L, C*patch_size] where L = (Hq*Wq) // patch_size.
+        Flattens spatial dims in raster order, groups adjacent positions.
+        """
         B, C, Hq, Wq = latents.shape
         x = latents.reshape(B, C, -1).transpose(1, 2)  # [B, Hq*Wq, C]
         p = self.patch_size
@@ -507,16 +519,18 @@ class BitDanceAR(nn.Module):
             L = x.shape[1]
             assert L % p == 0, f"Spatial size {L} not divisible by patch_size {p}"
             x = x.reshape(B, L // p, C * p)
-        return x
+        return x  # [B, L, C*p]
 
     def unpatchify(self, x: torch.Tensor, Hq: int, Wq: int) -> torch.Tensor:
-        """[B, L, C*patch_size] → [B, C, Hq, Wq]"""
+        """
+        [B, L, C*patch_size] → [B, C, Hq, Wq]
+        """
         B = x.shape[0]
         p = self.patch_size
         C = self.latent_dim
         if p > 1:
-            x = x.reshape(B, -1, C)
-        x = x[:, :Hq * Wq, :]
+            x = x.reshape(B, -1, C)  # [B, Hq*Wq, C]
+        x = x[:, :Hq * Wq, :]  # safety trim
         return x.transpose(1, 2).reshape(B, C, Hq, Wq)
 
     # ── Tag dropout for CFG ──────────────────────────────────────────────────
@@ -530,63 +544,7 @@ class BitDanceAR(nn.Module):
             tag_tokens[drop_mask] = self.pad_tag_id
         return tag_tokens
 
-    # ── Forward 1: Style Extraction ──────────────────────────────────────────
-
-    def forward_style(
-        self,
-        latents: torch.Tensor,
-        shape_h_ids: torch.Tensor,
-        shape_w_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward 1: Extract style tokens from image with FULL attention.
-
-        Sequence: [32 learnable style queries, image tokens]
-        Attention: FULL (bidirectional)
-        Output: bit-quantized predicted style tokens at the 32 query positions
-
-        Args:
-            latents:      [B, C, Hq, Wq] — binary {-1, +1}
-            shape_h_ids:  [B]
-            shape_w_ids:  [B]
-        Returns:
-            style_preds:     [B, 32, latent_dim] — continuous predictions
-            style_preds_bin: [B, 32, latent_dim] — bit-quantized {-1, +1} via STE
-        """
-        B = latents.shape[0]
-        _, _, Hq, Wq = latents.shape
-        N_style = NUM_STYLE_TOKENS
-
-        # ── Project style tokens to d_model as queries ──
-        style_queries = self.style_query_proj(self.style_tokens)  # [32, d_model]
-        style_queries = style_queries.unsqueeze(0).expand(B, -1, -1)  # [B, 32, d_model]
-
-        # ── Patchify and project image latents ──
-        lat_seq = self.patchify(latents)  # [B, L, C*p]
-        img_tokens = self.proj_in(lat_seq)  # [B, L, d_model]
-
-        # ── Concatenate: [style_queries, img_tokens] ──
-        L = img_tokens.shape[1]
-        x = torch.cat([style_queries, img_tokens], dim=1)  # [B, 32+L, d_model]
-        x = self.emb_norm(x)
-
-        # ── Build 2D positions ──
-        pos_x, pos_y = self._build_2d_positions(B, N_style, L, Hq, Wq, latents.device)
-
-        # ── Run transformer with FULL attention ──
-        for layer in self.layers:
-            x = layer(x, pos_x=pos_x, pos_y=pos_y, full_attention=True)
-        x = self.ln_f(x)
-
-        # ── Extract style predictions at query positions ──
-        style_preds = self.style_pred_proj(x[:, :N_style])  # [B, 32, latent_dim]
-
-        # ── Bit quantize using STE so diff_loss can backprop through it ──
-        style_preds_bin = BinarySTE.apply(style_preds)  # {-1, +1}
-
-        return style_preds, style_preds_bin
-
-    # ── Training Forward (Dual-Forward) ──────────────────────────────────────
+    # ── Training Forward ─────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -594,278 +552,21 @@ class BitDanceAR(nn.Module):
         latents: torch.Tensor,
         shape_h_ids: torch.Tensor,
         shape_w_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Training forward pass with dual-forward style + diffusion objectives.
-
-        Forward 1: Style extraction (full attention)
-            [32 learnable tokens, image] → predict style tokens → style loss
-            Style loss is DETACHED from transformer — only updates style_tokens
-
-        Forward 2: Image generation (causal attention)
-            [shape, tags, style_cond, image] → diffusion loss
-            Diffusion loss updates the transformer (and backprops through style_cond)
+        Training forward pass.
 
         Args:
             tag_tokens:   [B, N_prefix] — [PAD, PAD, tag_1, ..., SEP, PAD...]
             latents:      [B, C, Hq, Wq] — binary {-1, +1}
-            shape_h_ids:  [B]
-            shape_w_ids:  [B]
+            shape_h_ids:  [B] — Hq values
+            shape_w_ids:  [B] — Wq values
         Returns:
-            total_loss:   scalar — diff_loss + style_loss_weight * style_loss
-            diff_loss:    scalar — diffusion loss (updates transformer & Forward 1)
-            style_loss:   scalar — style prediction loss (updates style_tokens only)
+            loss: scalar diffusion loss
         """
         B = tag_tokens.shape[0]
-        N_tags = tag_tokens.shape[1]
+        N_prefix = tag_tokens.shape[1]
         _, _, Hq, Wq = latents.shape
-        device = latents.device
 
-        # ════════════════════════════════════════════════════════════════════
-        # Forward 1: Style Extraction (FULL attention)
-        # ════════════════════════════════════════════════════════════════════
-        _, style_preds_bin = self.forward_style(latents, shape_h_ids, shape_w_ids)
-        # style_preds_bin: [B, 32, latent_dim] in {-1, +1} via STE
-
-        # Style loss: DETACHED. Only updates self.style_tokens, NO gradient to transformer
-        style_target = self.style_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, 32, latent_dim]
-        style_loss = F.mse_loss(style_preds_bin.detach(), style_target)
-
-        # ════════════════════════════════════════════════════════════════════
-        # Forward 2: Image Generation (CAUSAL attention)
-        # ════════════════════════════════════════════════════════════════════
-
-        # ── Choose random k ∈ {1, 4, 8, 16, 32} style tokens to use ──
-        k_choices = [1, 4, 8, 16, 32]
-        k = k_choices[torch.randint(0, len(k_choices), (1,), device=device).item()]
-        k = min(k, NUM_STYLE_TOKENS)
-
-        # NO detach() here! We WANT the diff_loss to backprop through style_preds_bin
-        # into the transformer (Forward 1) and the learnable style tokens.
-        style_cond = style_preds_bin[:, :k]  # [B, k, latent_dim]
-        style_cond_embed = self.style_cond_proj(style_cond)  # [B, k, d_model]
-
-        # ── Build prefix: [shape_h, shape_w, tags, style_cond] ──
-        shape_h = self.shape_h_embed(shape_h_ids).unsqueeze(1)  # [B, 1, d_model]
-        shape_w = self.shape_w_embed(shape_w_ids).unsqueeze(1)  # [B, 1, d_model]
-        tag_embeds = self.tag_embed(self.drop_tags(tag_tokens))  # [B, N_tags, d_model]
-
-        prefix = torch.cat([shape_h, shape_w, tag_embeds, style_cond_embed], dim=1)
-        N_prefix = prefix.shape[1]  # 2 + N_tags + k
-
-        # ── Patchify and project image latents ──
-        lat_seq = self.patchify(latents)  # [B, L, C*p] — clean targets
-        L = lat_seq.shape[1]
-
-        # Perturb image tokens for transformer input regularization
-        if self.perturb_rate > 0 and self.training:
-            lat_seq_perturbed = flip_binary(lat_seq, self.perturb_rate)
-        else:
-            lat_seq_perturbed = lat_seq
-
-        img_tokens = self.proj_in(lat_seq_perturbed)  # [B, L, d_model]
-
-        # ── Concatenate: [prefix, img_tokens] ──
-        x = torch.cat([prefix, img_tokens], dim=1)  # [B, N_prefix + L, d_model]
-        x = self.emb_norm(x)
-
-        # ── Build 2D positions ──
-        pos_x, pos_y = self._build_2d_positions(B, N_prefix, L, Hq, Wq, device)
-
-        # ── Run transformer with CAUSAL attention ──
-        for layer in self.layers:
-            x = layer(x, pos_x=pos_x, pos_y=pos_y, full_attention=False)
-        x = self.ln_f(x)
-
-        # ── Extract conditioning hidden states for image token prediction ──
-        # Hidden state at position (N_prefix-1+i) predicts image token i
-        # So conditioning = x[:, N_prefix-1 : N_prefix-1+L]
-        cond_hidden = x[:, N_prefix - 1: N_prefix - 1 + L]  # [B, L, d_model]
-
-        # ── Add 2D position embedding for target patches ──
-        rows, cols = self._diff_position_indices(L, Hq, Wq, device)
-        pos_emb = self.pos_for_diff(rows, cols)  # [L, d_model]
-        cond = cond_hidden + pos_emb.unsqueeze(0)  # [B, L, d_model]
-
-        # ── Prepare for DiffHead ──
-        # Flatten batch and sequence dims
-        cond_flat = cond.reshape(B * L, -1)  # [B*L, d_model]
-        targets_flat = lat_seq.reshape(B * L, -1)  # [B*L, C*p] — clean targets
-
-        # Apply diff_batch_mul for more diverse timestep sampling
-        if self.diff_batch_mul > 1:
-            cond_flat = cond_flat.repeat(self.diff_batch_mul, 1)
-            targets_flat = targets_flat.repeat(self.diff_batch_mul, 1)
-
-        # ── Diffusion loss ──
-        diff_loss = self.head(targets_flat, cond_flat)
-
-        # ── Total loss ──
-        total_loss = diff_loss + self.style_loss_weight * style_loss
-
-        return total_loss, diff_loss, style_loss
-
-    # ── Inference Sampling ───────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def sample(
-        self,
-        tag_tokens: torch.Tensor,
-        shape_h_id: torch.Tensor,
-        shape_w_id: torch.Tensor,
-        Hq: int,
-        Wq: int,
-        num_sampling_steps: int = 50,
-        cfg_scale: float = 1.5,
-        num_style_tokens: int = NUM_STYLE_TOKENS,
-        reference_latents: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Autoregressive sampling with style conditioning.
-
-        Args:
-            tag_tokens:         [1, N_tags] — conditioning tags
-            shape_h_id:         [1] — Hq bucket id
-            shape_w_id:         [1] — Wq bucket id
-            Hq, Wq:             latent grid dimensions
-            num_sampling_steps: diffusion steps per AR token
-            cfg_scale:          classifier-free guidance scale
-            num_style_tokens:   number of style tokens to use (1-32)
-            reference_latents:  optional [1, C, Hq_ref, Wq_ref] for style extraction
-        Returns:
-            latents: [1, C, Hq, Wq] — sampled binary latents in {-1, +1}
-        """
-        device = tag_tokens.device
-        B = tag_tokens.shape[0]
-        p = self.patch_size
-        L = (Hq * Wq) // p
-        k = min(num_style_tokens, NUM_STYLE_TOKENS)
-
-        # ── Get style tokens ──
-        if reference_latents is not None:
-            # Extract style from reference image via forward 1
-            _, style_preds_bin = self.forward_style(
-                reference_latents, shape_h_id, shape_w_id
-            )
-            style_cond = style_preds_bin[:, :k]  # [B, k, latent_dim]
-        else:
-            # Use learnable style tokens (apply sign for binary)
-            style_cond = torch.sign(self.style_tokens[:k])  # [k, latent_dim]
-            style_cond = style_cond.unsqueeze(0).expand(B, -1, -1)  # [B, k, latent_dim]
-
-        # ── CFG: duplicate batch (first half conditioned, second half unconditioned) ──
-        use_cfg = cfg_scale != 1.0
-        if use_cfg:
-            B_eff = B * 2
-            tag_tokens_eff = torch.cat([
-                tag_tokens,
-                torch.full_like(tag_tokens, self.pad_tag_id)
-            ], dim=0)
-            shape_h_eff = shape_h_id.repeat(2)
-            shape_w_eff = shape_w_id.repeat(2)
-            style_cond_eff = torch.cat([
-                style_cond,
-                torch.zeros_like(style_cond)
-            ], dim=0)
-        else:
-            B_eff = B
-            tag_tokens_eff = tag_tokens
-            shape_h_eff = shape_h_id
-            shape_w_eff = shape_w_id
-            style_cond_eff = style_cond
-
-        # ── Build prefix ──
-        shape_h = self.shape_h_embed(shape_h_eff).unsqueeze(1)  # [B_eff, 1, d_model]
-        shape_w = self.shape_w_embed(shape_w_eff).unsqueeze(1)  # [B_eff, 1, d_model]
-        tag_embeds = self.tag_embed(tag_tokens_eff)  # [B_eff, N_tags, d_model]
-        style_embeds = self.style_cond_proj(style_cond_eff)  # [B_eff, k, d_model]
-
-        prefix = torch.cat([shape_h, shape_w, tag_embeds, style_embeds], dim=1)
-        N_prefix = prefix.shape[1]
-        prefix = self.emb_norm(prefix)
-
-        # ── 2D positions for prefix ──
-        pos_x_prefix, pos_y_prefix = self._build_2d_positions(
-            B_eff, N_prefix, 0, Hq, Wq, device
-        )
-
-        # ── Enable KV cache ──
-        max_len = N_prefix + L
-        for layer in self.layers:
-            layer.attn.enable_cache(B_eff, max_len, device, prefix.dtype)
-
-        # ── Prefill prefix ──
-        x = prefix
-        for layer in self.layers:
-            x = layer(x, pos_x=pos_x_prefix, pos_y=pos_y_prefix,
-                      full_attention=False)
-        x = self.ln_f(x)
-
-        # Last prefix hidden state conditions first image token
-        prev_hidden = x[:, -1:]  # [B_eff, 1, d_model]
-
-        # ── Autoregressive generation ──
-        sampled_tokens = []
-
-        for i in range(L):
-            # Target patch i's 2D position (for DiffHead position embedding)
-            spatial = i * p + p // 2
-            row_i = int(spatial // Wq)
-            col_i = int(spatial % Wq)
-            pos_emb = self.pos_for_diff(
-                torch.tensor([row_i], device=device, dtype=torch.long),
-                torch.tensor([col_i], device=device, dtype=torch.long),
-            )  # [1, d_model]
-
-            # Condition = prev_hidden + target position embedding
-            cond = prev_hidden + pos_emb.unsqueeze(0)  # [B_eff, 1, d_model]
-
-            # Apply CFG to hidden states
-            if use_cfg:
-                h_cond = cond[:B]      # [B, 1, d_model]
-                h_uncond = cond[B:]    # [B, 1, d_model]
-                h_cfg = h_uncond + cfg_scale * (h_cond - h_uncond)
-                cond_flat = h_cfg.reshape(B, -1)  # [B, d_model]
-            else:
-                cond_flat = cond.reshape(B_eff, -1)  # [B, d_model]
-
-            # Sample via diffusion head (CFG already applied to hidden states)
-            sampled = self.head.sample(cond_flat, 1.0, num_sampling_steps)
-            # sampled: [B, C*p]
-
-            sampled_token = sampled.unsqueeze(1)  # [B, 1, C*p]
-            sampled_tokens.append(sampled_token)
-
-            # Project to d_model for next AR step
-            next_input = self.proj_in(sampled_token)  # [B, 1, d_model]
-            next_input = self.emb_norm(next_input)
-
-            # Duplicate for cond and uncond paths if using CFG
-            if use_cfg:
-                next_input = next_input.repeat(2, 1, 1)  # [B_eff, 1, d_model]
-
-            # HARoPE position for this token (patch i's 2D position)
-            pos_x_next = torch.full(
-                (B_eff, 1), float(col_i), device=device, dtype=torch.float32
-            )
-            pos_y_next = torch.full(
-                (B_eff, 1), float(row_i), device=device, dtype=torch.float32
-            )
-
-            # Forward through transformer (single token, uses KV cache)
-            x = next_input
-            for layer in self.layers:
-                x = layer(x, pos_x=pos_x_next, pos_y=pos_y_next,
-                          full_attention=False)
-            x = self.ln_f(x)
-
-            prev_hidden = x  # [B_eff, 1, d_model]
-
-        # ── Disable KV cache ──
-        for layer in self.layers:
-            layer.attn.disable_cache()
-
-        # ── Collect and unpatchify ──
-        all_tokens = torch.cat(sampled_tokens, dim=1)  # [B, L, C*p]
-        latents = self.unpatchify(all_tokens, Hq, Wq)  # [B, C, Hq, Wq]
-        return latents
+        # Patchify latent
+        lat_seq = self.patchify(latents)  # [B
